@@ -1,0 +1,651 @@
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/include/linux/tcp_bw_est.h linux-3.12.38.modified/include/linux/tcp_bw_est.h
+--- linux-3.12.38/include/linux/tcp_bw_est.h	2015-07-07 22:29:40.057855829 -0400
++++ linux-3.12.38.modified/include/linux/tcp_bw_est.h	2015-07-07 22:08:33.529800593 -0400
+@@ -17,7 +17,7 @@
+ #define BW_EST_AVG_WINDOW_SIZE_SHIFT  10
+ #define BW_EST_AVG_WINDOW_SIZE   (1 << BW_EST_AVG_WINDOW_SIZE_SHIFT)
+ #define BW_EST_MIN_FIFO_ENTRIES_TO_ENABLE
+-#define BW_EST_CONT_TH_US    20
++#define BW_EST_CONT_TH_US    150
+ 
+ typedef struct avg_fifo {
+     unsigned int rd;
+@@ -33,15 +33,32 @@
+ typedef struct pkt_series {
+     unsigned int sent;
+     unsigned int recvd;
++    unsigned int echo_recvd;
++    unsigned int seq;
++    unsigned int rtt;
++//    unsigned int echo_delta;
++    unsigned char pushed_cont;
++//    unsigned int seq_delta;
+ }pkt_series_t;
+ 
+ /* Store timing when packet has been sent back to back
+  * (less than threshold)
+  * */
+ typedef struct cont_series {
+-    unsigned int prev_rx;
+-    unsigned int rx;
+-    unsigned int delta; /* Time between previous (prev_rx) and current (rx) */
++//    unsigned int prev_rx;
++//    unsigned int rx;
++    unsigned int rx_delta; /* Time between previous (prev_rx) and current (rx) */
++    unsigned int tx_delta; /* Time between previous (prev_tx) and current (tx) */
++    /* Time between previous (echo tx) and current (echo  tx) */
++    unsigned int echo_delta;
++    unsigned int rtt;
++    unsigned int btl;
++    unsigned int min_link;
++    unsigned int utl;
++    unsigned int btl_res;
++//    unsigned int seq_delta;
++//    unsigned int seq;
++    unsigned char first;
+ }cont_series_t;
+ 
+ /* Store transmissions and arrival timings of two packets
+@@ -118,6 +135,9 @@
+     unsigned int utl;  /* Current bottle neck utilization  */
+     tcp_bw_est_type_t est_mode;   /* Type of estimation mode */
+     unsigned int cont_delta_hist[7];
++    unsigned int first_min_rtt;   /* Minimum rtt for the first packet on the pair */
++    unsigned int sec_min_rtt; /* Minimum rtt for the second packet on the pair */
++    unsigned int blt_min_intvl;  /* Minimum interval bottleneck */
+ 
+ }bw_est_stats_t;
+ 
+@@ -231,26 +251,39 @@
+  *   Otherwise, error
+  * */
+ static inline int bw_est_fifo_push_cont_series (avg_fifo_t *fifo_p,
+-      const cont_series_t *pkt_series_p)
++      cont_series_t *pkt_series_p)
+ {
+     cont_series_t *array = (cont_series_t *)fifo_p->array;
+     if (likely (bw_est_fifo_full(fifo_p))) {
+         /* Remove oldest entry from accumulator.
+-         * WARNING: Accumulatore mus not be negative */
+-        if (unlikely (fifo_p->accum < array[fifo_p->rd].delta)) {
++         * WARNING: Accumulator must not be negative
++         */
++        if (unlikely (fifo_p->accum < array[fifo_p->rd].rx_delta)) {
+             /* Log error */
+             return 0;
+         } else {
+-            fifo_p->accum -= array[fifo_p->rd].delta;
++        	/* If first packet, use existing packet series in queue since
++        	 * no valid rx delta value in argued packet series
++        	 *  */
++        	if (pkt_series_p->first) {
++        		pkt_series_p->rx_delta = array[fifo_p->rd].rx_delta;
++        	}
++
++        	fifo_p->accum -= array[fifo_p->rd].rx_delta;
+             fifo_p->rd = fifo_inc(fifo_p->rd, BW_EST_AVG_WINDOW_SIZE);
+         }
+ 
+     } else {
+         fifo_p->count++;
++        /* If first packet, Try to reduce unknown rx_delta value by choosing
++         * the queue average */
++        if (pkt_series_p->first) {
++        	pkt_series_p->rx_delta = fifo_p->accum / (fifo_p->count? fifo_p->count : 1);
++		}
+     }
+ 
+     /* Add new value */
+-    fifo_p->accum += pkt_series_p->delta;
++    fifo_p->accum += pkt_series_p->rx_delta;
+ 
+     /* Add packet and adjust average */
+     memcpy (&array[fifo_p->wr], pkt_series_p, sizeof(*pkt_series_p));
+@@ -362,5 +395,8 @@
+  * Print continuous series samples
+  */
+ void tcp_bw_est_print_cont_series (struct tcp_sock *tp);
++/* Measure bandwdith estimation using capprobe algorithm */
++int tcp_capprobe_m_bw_est(struct tcp_sock *tp, struct sk_buff *skb);
++
+ 
+ #endif /* _TCP_BW_EST_ */
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/net/ipv4/tcp.c linux-3.12.38.modified/net/ipv4/tcp.c
+--- linux-3.12.38/net/ipv4/tcp.c	2015-07-07 22:29:40.061855829 -0400
++++ linux-3.12.38.modified/net/ipv4/tcp.c	2015-07-07 22:11:33.441808439 -0400
+@@ -2228,7 +2228,8 @@
+ 		}
+ 	}
+ 
+-	tcp_bw_est_print_intvl_series(tcp_sk(sk));
++	tcp_bw_est_print_cont_series(tcp_sk(sk));
++
+ 	if (sk->sk_state == TCP_CLOSE) {
+ 		struct request_sock *req = tcp_sk(sk)->fastopen_rsk;
+ 		/* We could get here with a non-NULL req if the socket is
+@@ -2393,11 +2394,13 @@
+         struct tcp_sock *tp = tcp_sk(sk);
+         int err = -1;   /* Assume error */
+ 
+-        if (tp->bw_est_stats.est_mode == val) {
+-               /* Value has not change. No need to apply change */
+-              err = 0;
+-              return err;
+-        }
++//        if (tp->bw_est_stats.est_mode == val) {
++//               /* Value has not change. No need to apply change */
++//        	  printk(KERN_ERR"no need stats=%u m_est=%u\n", (unsigned int)&tp->bw_est_stats,
++//        			  (unsigned int)&tp->m_bw_est);
++//              err = 0;
++//              return err;
++//        }
+ 
+         if (likely((tp->bw_est_stats.est_mode > TCP_BW_EST_TYPE_MIN) &&
+               (tp->bw_est_stats.est_mode < TCP_BW_EST_TYPE_MAX))) {
+@@ -2407,6 +2410,8 @@
+               if (!err) {
+                     tp->bw_est_stats.est_mode = val;
+               }
++              printk(KERN_ERR"stats=%u m_est=%u\n", (unsigned int)&tp->bw_est_stats,
++            		  (unsigned int)&tp->m_bw_est);
+         }
+         return err;
+ }
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/net/ipv4/tcp_bw_est.c linux-3.12.38.modified/net/ipv4/tcp_bw_est.c
+--- linux-3.12.38/net/ipv4/tcp_bw_est.c	2015-07-07 22:29:40.061855829 -0400
++++ linux-3.12.38.modified/net/ipv4/tcp_bw_est.c	2015-07-07 22:08:33.553800594 -0400
+@@ -152,13 +152,13 @@
+        case TCP_BW_EST_TYPE_MD1:
+            ret = (int)(TCP_BW_EST_UTIL_SCALE * (bl + TCP_BW_EST_BL_SCALE) -
+                  ll_sqrt( TCP_BW_EST_UTIL_SCALE_POW2 * ((bl*bl)+
+-                      TCP_BW_EST_BL_SCALE ) ));
++                      TCP_BW_EST_BL_SCALE *  TCP_BW_EST_BL_SCALE) ));
+            ret = ret >> TCP_BW_EST_BL_SCALE_SHIFT;
+            break;
+        case TCP_BW_EST_TYPE_MM1:
+ 
+-           tmp = (bl * TCP_BW_EST_UTIL_SCALE) +
+-              tp->m_bw_est.mm1.util_res;
++           tmp = (bl * TCP_BW_EST_UTIL_SCALE);   //+
++//              tp->m_bw_est.mm1.util_res;
+            tp->m_bw_est.mm1.util_res = __div64_32 (&tmp, bl + TCP_BW_EST_BL_SCALE);
+            ret = (int)tmp;
+ 
+@@ -209,10 +209,9 @@
+  * Note: Pointer argument is not checked for sanity to improve
+  *       performance.
+  */
+-inline int tcp_bw_est(struct sock *sk)
++inline int tcp_bw_est(struct tcp_sock *tp)
+ {
+-    struct tcp_sock *tp = tcp_sk(sk);
+-    int util = tcp_bw_utlization_est(tp);
++    const int util = tcp_bw_utlization_est(tp);
+     u64 bdpe_64; /* Estimated bw product */
+ 
+     if (unlikely(util < 0)) {
+@@ -223,9 +222,9 @@
+     /* scale * link (1 - p) = link ( scale - (scale * p) ) */
+     bdpe_64 = tp->bw_est_stats.link_capacity * (TCP_BW_EST_UTIL_SCALE - util);
+     bdpe_64 = ((bdpe_64 >> TCP_BW_EST_UTIL_SCALE_SHIFT) *
+-          (jiffies_to_usecs(tp->rcv_rtt_est.rtt)>>3)) + tp->bw_est_stats.bdpe_res;
++          (jiffies_to_usecs(tp->srtt)>>3)) + tp->bw_est_stats.bdpe_res;
+     tp->bw_est_stats.bdpe_res = __div64_32 (&bdpe_64,
+-          inet_csk(sk)->icsk_ack.rcv_mss * USEC_PER_SEC /* Normalizing rtt */);
++    		tp->mss_cache * USEC_PER_SEC /* Normalizing rtt */);
+     tp->bw_est_stats.bdpe_tx = (u32)bdpe_64;
+     tp->bw_est_stats.tx_bw_found = 1;
+     tp->bw_est_stats.utl = util;
+@@ -290,6 +289,269 @@
+ 	return 0;
+ }
+ 
++/*
++ * Calculates minimum bottleneck length
++ * @return: - 0 - Success calculating minimum bottleneck length. Otherwise,
++ * 			Error
++ *
++ * 	Note: Function arguments sanity are not checked for performance issues
++ */
++static inline int tcp_bw_est_calc_rx_delta_mean(struct tcp_sock *tp,
++		unsigned int delta_rx)
++{
++	/* Get reception delta mean. Window size is multiple
++	             * of two */
++	avg_fifo_t *cont_series_fifo_p = &tp->m_bw_est.cont_series_fifo;
++	if (likely(cont_series_fifo_p->count)) {
++		unsigned int accum = cont_series_fifo_p->accum + tp->bw_est_stats.cont_mean_res;
++		tp->bw_est_stats.cont_mean = accum / cont_series_fifo_p->count;
++		tp->bw_est_stats.cont_mean_res = accum % cont_series_fifo_p->count;
++	} else {
++		tp->bw_est_stats.cont_mean = cont_series_fifo_p->accum + tp->bw_est_stats.cont_mean_res;
++		tp->bw_est_stats.cont_mean_res = 0;
++	}
++	return 0;
++}
++
++/*
++ * Calculates minimum bottleneck length
++ * @return: - 0 - Success calculating minimum bottleneck length. Otherwise,
++ * 			Error
++ *
++ * Note: Function arguments sanity are not checked for performance issues
++ */
++static inline int tcp_bw_est_calc_bltneck_len(struct tcp_sock *tp)
++{
++	u32 blt_min_intvl = tp->bw_est_stats.blt_min_intvl;
++	u32 cont_mean = tp->bw_est_stats.cont_mean;
++	unsigned int btl_neck;
++	if (cont_mean > blt_min_intvl) {
++		btl_neck = ((cont_mean - blt_min_intvl) * TCP_BW_EST_BL_SCALE) + tp->bw_est_stats.btl_neck_res;
++	}
++	else {
++		/* Continuous packet average equal or greater than capacity bottle neck? */
++		/* Assume not bottleneck */
++		btl_neck = tp->bw_est_stats.btl_neck_res * TCP_BW_EST_BL_SCALE;
++	}
++
++	tp->bw_est_stats.btl_neck = btl_neck /
++			(likely(blt_min_intvl)? blt_min_intvl : 1);
++	tp->bw_est_stats.btl_neck_res = btl_neck % blt_min_intvl;
++
++	return 0;
++}
++
++/*
++ * Calculates bottle neck link capacity
++ * @return: - 0 - Success calculating capacity. Otherwise,
++ * 			Error
++ */
++static inline int tcp_bw_est_calc_capacity (struct tcp_sock *tp)
++{
++	u64 link_capacity = ((u64)tp->mss_cache * (u64)USEC_PER_SEC) +
++		  (u64)tp->bw_est_stats.link_capacity_res;
++
++	u32 blt_min_intvl = tp->bw_est_stats.blt_min_intvl;
++	tp->bw_est_stats.link_capacity_res =
++		  __div64_32(&link_capacity, likely(blt_min_intvl)? blt_min_intvl : 1);
++	tp->bw_est_stats.link_capacity = link_capacity;
++
++	return 0;
++}
++
++/*
++ * Estimate bottleneck minimum interval between packets. The inverse of this values
++ * is the bottle neck capacity
++ * @return - 0 If success processing bottleneck minimum interval. Otherwise
++ * 			 Error
++ * Note: Function arguments sanity are not checked for performance issues
++ */
++static inline int tcp_bw_est_find_btl_min_rx_intvl (struct tcp_sock *tp,
++		cont_series_t *cont_first_p, pkt_series_t *last_pkt_series_p,
++		unsigned int rx_delta, unsigned int rtt)
++{
++	int ret = -1;  /* Assume error finding min interval */
++
++	unsigned int first_rtt = 0, second_rtt = 0;
++	unsigned char no_error = 0;  /*Assume error */
++	unsigned int old_first_rtt = tp->bw_est_stats.first_min_rtt;
++	unsigned int old_second_rtt = tp->bw_est_stats.sec_min_rtt;
++
++	/* Find if packet is first on the pair */
++	if (cont_first_p->first) {
++		if (unlikely (!old_first_rtt)) {
++			old_first_rtt = tp->bw_est_stats.first_min_rtt = cont_first_p->rtt;
++		}
++		if (unlikely (!old_second_rtt)) {
++			old_second_rtt = tp->bw_est_stats.sec_min_rtt = rtt;
++		}
++		first_rtt = cont_first_p->rtt;
++		second_rtt = rtt;
++		no_error = 1;
++
++	} else if (last_pkt_series_p->pushed_cont) {
++		/* If did not see the first packet on a packets train but
++		 * the packet is described as a first in a packet pair
++		 * (A second packets follows it)
++		 */
++		if (unlikely (!old_first_rtt)){
++			old_first_rtt = tp->bw_est_stats.first_min_rtt = last_pkt_series_p->rtt;
++		}
++		if (unlikely (!old_second_rtt)) {
++			old_second_rtt = tp->bw_est_stats.sec_min_rtt = rtt;
++		}
++		first_rtt = last_pkt_series_p->rtt;
++		second_rtt = rtt;
++		no_error = 1;
++	} else {
++		/* Error, not sure how you get here. Log it */
++		return ret;
++	}
++
++	if (likely(no_error)) {
++//		char min_changed = 0;   /* Checks if new min has been found */
++		/* Compare min sum with current sum plus margin of error */
++
++		if ((first_rtt + second_rtt) < (old_first_rtt + old_second_rtt)) {
++			/* If min is true, get capacity */
++			tp->bw_est_stats.blt_min_intvl = rx_delta;
++			tcp_bw_est_calc_capacity(tp);
++		}
++
++		/* Update for min in first and second if required */
++		if (first_rtt < old_first_rtt) {
++			tp->bw_est_stats.first_min_rtt = first_rtt;
++		}
++		if (second_rtt < old_second_rtt) {
++			tp->bw_est_stats.sec_min_rtt = second_rtt;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * Estimate available bandwidth by using capprobe techniques
++ * and Markov queue based theory
++ * return: - Success processsing Markov based bandwidth estimation. Otherwise,
++ *           error.
++ */
++int tcp_capprobe_m_bw_est(struct tcp_sock *tp, struct sk_buff *skb)
++{
++	int ret = -1;  /* Assume error */
++	avg_fifo_t *pkt_series_fifo_p = &tp->m_bw_est.pkt_series_fifo;
++	pkt_series_t pkt_series;
++
++	unsigned int rcv_tsecr_us = tp->rx_opt.rcv_tsecr_us;
++	const unsigned int ts = tcp_bw_get_skb_stamp_us(skb);
++	unsigned int rtt = (unsigned int)((signed int)ts -
++				(signed int)rcv_tsecr_us);
++	pkt_series.recvd = ts;
++	pkt_series.echo_recvd = rcv_tsecr_us;
++	pkt_series.sent = tp->rx_opt.rcv_tsval_us;
++	pkt_series.seq = TCP_SKB_CB(skb)->ack_seq;
++	pkt_series.pushed_cont = 0;
++	pkt_series.rtt = rtt;
++
++	if (likely (!bw_est_fifo_empty(pkt_series_fifo_p))) {
++
++		/* The packet is a continuous series */
++		cont_series_t cont_series, cont_first;
++
++		pkt_series_t *last_pkt_series_p =
++					  __bw_est_fifo_peek_last_series(pkt_series_fifo_p);
++
++		unsigned int seq_delta = (unsigned int)((signed int)pkt_series.seq -
++				(signed int)last_pkt_series_p->seq);
++		/* pkt_series.echo_delta = */
++		unsigned int echo_delta = (unsigned int)((signed int)pkt_series.echo_recvd -
++											(signed int)last_pkt_series_p->echo_recvd);
++//		pkt_series.seq_delta = seq_delta;
++
++		if ((echo_delta < BW_EST_CONT_TH_US) &&
++				(seq_delta <= tp->mss_cache)) {
++			/* Measure rx delta */
++			unsigned int delta_rx = (unsigned int)((signed int)pkt_series.recvd -
++						  (signed int)last_pkt_series_p->recvd);
++
++			avg_fifo_t *cont_series_fifo_p = &tp->m_bw_est.cont_series_fifo;
++
++			cont_first.first = 0;  /* Have not seen first packet yet */
++			// If previous packet series was not pushed, push it
++			if (!last_pkt_series_p->pushed_cont) {
++
++//				cont_series.prev_rx = 0;
++//				cont_series.rx = 0;
++				cont_first.rtt = last_pkt_series_p->rtt;
++				cont_first.first = 1;  /* First packet in packet train */
++				cont_first.rx_delta = 0;  /* Require when pushing on queue */
++//				cont_series.seq = last_pkt_series_p->seq;
++//				cont_series.echo_delta = last_pkt_series_p->echo_delta;
++//				cont_series.seq_delta = last_pkt_series_p->seq_delta;
++
++				if (unlikely (!bw_est_fifo_push_cont_series(cont_series_fifo_p, &cont_first))) {
++					tp->bw_est_stats.cont_push_err++;
++					return -1;
++				}
++				last_pkt_series_p->pushed_cont = 1;
++			}
++			tp->bw_est_stats.cont_delta_hist[0]++;
++			// Now pushed current packet series
++			cont_series.tx_delta = (unsigned int)((signed int)pkt_series.sent -
++							(signed int)last_pkt_series_p->sent);
++//			cont_series.prev_rx = last_pkt_series_p->recvd;
++//			cont_series.rx = pkt_series.recvd;
++			cont_series.rx_delta = likely((int)delta_rx > 0)? delta_rx : 0;
++			cont_series.rtt = rtt;
++;
++			cont_series.first = 0; /* Not the first packet in packet train */
++//			cont_series.seq = pkt_series.seq;
++			cont_series.echo_delta = echo_delta;
++//			cont_series.seq_delta = seq_delta;
++
++//			if (unlikely (!bw_est_fifo_push_cont_series(cont_series_fifo_p, &cont_series))) {
++//				tp->bw_est_stats.cont_push_err++;
++//				bw_est_fifo_push_pkt_series(pkt_series_fifo_p, &pkt_series);
++//				return -1;
++//			}
++			pkt_series.pushed_cont = 1;  /* Marked packets as pushed */
++
++			/* Now find capacity by detecting minimum rtt delay */
++			if (tcp_bw_est_find_btl_min_rx_intvl(tp, &cont_first, last_pkt_series_p,
++					cont_series.rx_delta, rtt)) {
++				tp->bw_est_stats.cont_push_err++;
++				bw_est_fifo_push_pkt_series(pkt_series_fifo_p, &pkt_series);
++				return -1;
++			}
++
++			tcp_bw_est_calc_rx_delta_mean(tp, delta_rx);
++
++			tcp_bw_est_calc_bltneck_len(tp);
++
++			cont_series.min_link = tp->bw_est_stats.blt_min_intvl;
++			cont_series.btl_res = tp->bw_est_stats.btl_neck_res;
++			cont_series.btl = tp->bw_est_stats.btl_neck;
++
++			/* Estimate available bandwidth */
++			ret = tcp_bw_est(tp);
++			cont_series.utl = tp->bw_est_stats.utl;
++
++			if (unlikely (!bw_est_fifo_push_cont_series(cont_series_fifo_p, &cont_series))) {
++				tp->bw_est_stats.cont_push_err++;
++				bw_est_fifo_push_pkt_series(pkt_series_fifo_p, &pkt_series);
++				return -1;
++			}
++		}
++		else
++			ret = 0;
++	} else
++		ret = 0;
++
++	bw_est_fifo_push_pkt_series(pkt_series_fifo_p, &pkt_series);
++
++	return ret;
++}
++
+ 
+ /* Markov queue based bandwidth estimation algorithm. Collect data,
+  * analyze it and calculate approximate network capacity.
+@@ -307,6 +569,9 @@
+     /* Store current sent time. At this point, it is assume the system has
+      * detected and store a timestmap */
+ 
++    // Remove return 0
++    return 0;
++
+ //    pkt_series.recvd = tcp_bw_get_stamp_us();
+     pkt_series.recvd = tcp_bw_get_skb_stamp_us(skb);
+ //    pkt_series.recvd = skb->h.th->seq;
+@@ -342,16 +607,17 @@
+ //        }
+ 
+         /* TODO: Remove Change condition */
+-        if (delta_tx > BW_EST_CONT_TH_US) {
++        if (delta_tx < BW_EST_CONT_TH_US) {
+             avg_fifo_t *cont_series_fifo_p = &tp->m_bw_est.cont_series_fifo;
+             int cont_delta = pkt_series.recvd - last_pkt_series_p->recvd;
+             /* The packet is a continuous series */
+             cont_series_t cont_series;
+ 
+             tp->bw_est_stats.cont_hits++;
+-            cont_series.prev_rx = last_pkt_series_p->recvd;
+-            cont_series.rx = pkt_series.recvd;
+-            cont_series.delta = likely(cont_delta > 0)? cont_delta : 0;
++            // TODO: Uncomment cont_series members assignment
++//            cont_series.prev_rx = last_pkt_series_p->recvd;
++//            cont_series.rx = pkt_series.recvd;
++            cont_series.rx_delta = likely(cont_delta > 0)? cont_delta : 0;
+             if (unlikely (!bw_est_fifo_push_cont_series(cont_series_fifo_p, &cont_series))) {
+                 tp->bw_est_stats.cont_push_err++;
+                 return -1;
+@@ -369,7 +635,7 @@
+ 
+             /* Calculate variance. Only executed in M/G/1 queue to save cpu cycles */
+             if (tp->bw_est_stats.est_mode == TCP_BW_EST_TYPE_MG1) {
+-                tcp_bw_est_calc_var(tp, tp->bw_est_stats.cont_mean - cont_series.delta);
++                tcp_bw_est_calc_var(tp, tp->bw_est_stats.cont_mean - cont_series.rx_delta);
+             }
+ 
+             /* Process continuous series histogram. TODO: uncomment */
+@@ -453,7 +719,7 @@
+         }
+ 
+         /* Estimate available bandwidth */
+-        ret = tcp_bw_est(sk);
++        ret = tcp_bw_est(tp);
+     }
+ 
+     bw_est_fifo_push_pkt_series(pkt_series_fifo_p, &pkt_series);
+@@ -520,20 +786,20 @@
+        /* Should be less than BW_EST_AVG_WINDOW_SIZE */
+ #define CONT_SAMPLES_PER_PRINTED_LINE   (BW_EST_AVG_WINDOW_SIZE>>5)
+ //#define CONT_STRING_FORMAT "idx=%u prx=%u rx=%u d=%u "
+-#define CONT_STRING_FORMAT "-idx=%u d=%u "
++#define CONT_STRING_FORMAT ">i=%u dr=%u r=%u f=%d b=%u m=%u u=%u de=%u dt=%u"
+ 
+         unsigned int i = 0;
+         unsigned char str [] = {PKT_STRING_FORMAT};
+         unsigned char *buf = (unsigned char *)
+               kmalloc(PKT_SAMPLES_PER_PRINTED_LINE * sizeof(u32) *
+-              BYTES_PER_ASCII * sizeof(str) * 4 /* prev rx, rx, delta and idx numbers */
++              BYTES_PER_ASCII * sizeof(str) * 9 /* prev rx, rx, deltas, seq, idx numbers etc */
+               * NIBBLES_PER_BYTE * 4 /* Extra space */,
+               GFP_ATOMIC);
+         int len = 0; /* Chars written */
+         cont_series_t *cont_series_p = &tp->m_bw_est.cont_series[0];
+ 
+         if (!buf) {
+-            printk(KERN_ERR"%s: Error, could not allocate print memory\n", __FUNCTION__);
++        	printk(KERN_ERR"%s: Error, could not allocate print memory\n", __FUNCTION__);
+             return;
+         }
+         if (!tp) {
+@@ -542,15 +808,17 @@
+         }
+         for (; i < BW_EST_AVG_WINDOW_SIZE; i++) {
+ //            len += sprintf (buf + len, CONT_STRING_FORMAT, i, cont_series_p[i].prev_rx,
+-//                  cont_series_p[i].rx, cont_series_p[i].delta);
+-            len += sprintf (buf + len, CONT_STRING_FORMAT, i, cont_series_p[i].delta);
++//                  cont_series_p[i].rxbtl, cont_series_p[i].delta);
++            len += sprintf (buf + len, CONT_STRING_FORMAT, i, cont_series_p[i].rx_delta,
++            		cont_series_p[i].rtt, cont_series_p[i].first, cont_series_p[i].btl,
++            		cont_series_p[i].min_link, cont_series_p[i].utl,
++            		cont_series_p[i].echo_delta, cont_series_p[i].tx_delta);
+             if (i && ((i % (CONT_SAMPLES_PER_PRINTED_LINE - 1)) == 0)) {
+                 printk(KERN_ERR "%s\n", buf);
+                 len = 0; /* Reset print offset */
+-
+             }
+         }
+-        printk(KERN_ERR"%s: ih=%d ch=%d h0=%d h1=%d h2=%d h3=%d h4=%d h5=%d h6=%d\n", __FUNCTION__,
++        printk(KERN_ERR"%s: ih=%d ch=%d h0=%u h1=%d h2=%d h3=%d h4=%d h5=%d h6=%u\n", __FUNCTION__,
+          tp->bw_est_stats.intvl_hits, tp->bw_est_stats.cont_hits,
+          tp->bw_est_stats.cont_delta_hist[0], tp->bw_est_stats.cont_delta_hist[1],
+          tp->bw_est_stats.cont_delta_hist[2], tp->bw_est_stats.cont_delta_hist[3], tp->bw_est_stats.cont_delta_hist[4],
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/net/ipv4/tcp_input.c linux-3.12.38.modified/net/ipv4/tcp_input.c
+--- linux-3.12.38/net/ipv4/tcp_input.c	2015-07-07 22:29:40.065855829 -0400
++++ linux-3.12.38.modified/net/ipv4/tcp_input.c	2015-07-07 22:27:00.697848879 -0400
+@@ -4816,6 +4816,8 @@
+ 	     __tcp_select_window(sk) >= tp->rcv_wnd) ||
+ 	    /* We ACK each frame or... */
+ 	    tcp_in_quickack_mode(sk) ||
++	    /* We are in bandwidth estimation mode */
++	    TCP_BW_IS_ACTIVE(tp) ||
+ 	    /* We have out of order data. */
+ 	    (ofo_possible && skb_peek(&tp->out_of_order_queue))) {
+ 		/* Then ack it now */
+@@ -5131,7 +5133,7 @@
+     struct tcp_sock *tp = tcp_sk(sk);
+ 
+     if (!tp->m_bw_est.processed) {
+-        if (tp->rx_opt.saw_tstamp) {
++    	if (tp->rx_opt.saw_tstamp) {
+            process_bw = 1;
+         }
+         else {
+@@ -5155,6 +5157,46 @@
+  }
+ 
+ /*
++ * Uses tcpprobe algorithm to estimate capacity
++ *
++ * return: 0 if success estimating capacity.
++ *         Non zero if failure
++ *
++ *  Note: tp pointer sanity is not checked for performance
++ */
++ int tcp_capprobe (struct tcp_sock *tp, struct sk_buff *skb,
++               const struct tcphdr *th)
++ {
++       int ret = -1; /* Assume failure estimating capacity */
++
++       /* Do not estimate bandwidth capacity yet */
++       unsigned char do_capprobe = 0;
++
++       if (!TCP_BW_IS_ACTIVE(tp)) return 0;
++
++       if (1) {
++               if (tp->rx_opt.saw_tstamp) {
++                       do_capprobe = 1;
++               }
++               else {
++                       /* Slow. Try to collect time stamp */
++                   tcp_fast_parse_options(skb, th, tp);
++                   if (tp->rx_opt.saw_tstamp) {
++                           do_capprobe = 1;
++                   } else {
++                          /* Statistics not collected. Log error */
++                   }
++               }
++       }
++
++       if (!do_capprobe) return -1;
++
++       ret = tcp_capprobe_m_bw_est(tp, skb);
++
++       return 0;
++ }
++
++/*
+  *	TCP receive function for the ESTABLISHED state.
+  *
+  *	It is split into a fast path and a slow path. The fast path is
+@@ -5262,6 +5304,9 @@
+ //				    printk(KERN_ERR"*1- %u\n", tp->bw_est_stats.bdpe_rx);
+ 				}
+ 
++				/* Estimate capacity */
++				tcp_capprobe (tp, skb, th);
++
+ 				/* We know that such packets are checksummed
+ 				 * on entry.
+ 				 */
+@@ -5309,7 +5354,7 @@
+ 					tcp_rcv_rtt_measure_ts(sk, skb);
+ 
+ 					/* Process bw estimation */
+-					tcp_bw_est_process(sk, th, skb);
++//					tcp_bw_est_process(sk, th, skb);
+ 
+ 					__skb_pull(skb, tcp_header_len);
+ 					tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;

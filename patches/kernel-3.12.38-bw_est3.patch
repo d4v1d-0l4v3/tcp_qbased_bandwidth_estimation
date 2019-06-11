@@ -1,0 +1,1178 @@
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/include/linux/tcp.h linux-3.12.38.modified/include/linux/tcp.h
+--- linux-3.12.38/include/linux/tcp.h	2015-07-07 22:02:58.489785981 -0400
++++ linux-3.12.38.modified/include/linux/tcp.h	2015-07-06 22:31:04.146525350 -0400
+@@ -99,7 +99,8 @@
+ 	u16	user_mss;	/* mss requested by user in ioctl	*/
+ 	u16	mss_clamp;	/* Maximal mss, negotiated at connection setup */
+ 	__u32 rcv_tsval_us;/* Time stamp value in microseconds */
+-	__u32 rcv_tsecr_us;/* Time stamp echo reply           */
++	__u32 rcv_tsecr_us;/* Time stamp echo reply          */
++	__u32 ts_recent_us;/* Time stamp to echo next in microseconds     */
+ };
+ 
+ static inline void tcp_clear_options(struct tcp_options_received *rx_opt)
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/include/linux/tcp_bw_est.h linux-3.12.38.modified/include/linux/tcp_bw_est.h
+--- linux-3.12.38/include/linux/tcp_bw_est.h	2015-07-07 22:02:57.521785938 -0400
++++ linux-3.12.38.modified/include/linux/tcp_bw_est.h	2015-07-06 22:31:04.146525350 -0400
+@@ -10,17 +10,21 @@
+ /* Includes */
+ #include <linux/compiler.h>
+ #include <linux/string.h>
++#include <linux/time.h>
++#include <linux/skbuff.h>
+ 
+ /* Size of averaging table (window) */
+-#define BW_EST_AVG_WINDOW_SIZE_SHIFT  3
++#define BW_EST_AVG_WINDOW_SIZE_SHIFT  10
+ #define BW_EST_AVG_WINDOW_SIZE   (1 << BW_EST_AVG_WINDOW_SIZE_SHIFT)
+ #define BW_EST_MIN_FIFO_ENTRIES_TO_ENABLE
++#define BW_EST_CONT_TH_US    20
+ 
+ typedef struct avg_fifo {
+     unsigned int rd;
+     unsigned int wr;
+     unsigned int size;
+     void *array;
++    int saccum;
+     unsigned int accum; /* Verify that accumulator does not require larger number */
+     unsigned int count;
+ }avg_fifo_t;
+@@ -51,7 +55,8 @@
+     unsigned int rx;
+     unsigned int prev_tx;
+     unsigned int tx;
+-    unsigned int est_bl;  /* Estimated bottle neck length */
++    int est_bl;  /* Estimated bottle neck length */
++    int accum;
+ }intvl_series_t;
+ 
+ /*!
+@@ -68,6 +73,8 @@
+ 
+ /* Collect bw estimation status */
+ typedef struct __bw_est_stats {
++    char tx_bw_found;  /* Calculated bandwidth is valid */
++    char snd_bw_en;
+    /* Store number of times time stamp was not found when processing
+     * time stamps */
+     unsigned int no_ts;
+@@ -76,11 +83,14 @@
+     /* Increase accuracy of continuous packet calculations  by taking account of
+      * residual from previous link capacity calculation */
+     unsigned int cont_mean_res;
++    unsigned cont_hits;
+     /* Mean of continuous series */
+-    unsigned int intvl_mean;
++    int intvl_mean;
++    /* Number of times pkt interval series has been registered */
++    unsigned int intvl_hits;
+     /* Keep track of interval divison residual for accurate interval pkt
+      * series avg calculation */
+-    unsigned int intvl_mean_res;
++    int intvl_mean_res;
+     /* Reflects max segment size at the same time cont mean has been measured */
+     unsigned int mss;
+     unsigned int cont_push_err;
+@@ -94,9 +104,9 @@
+     unsigned int bdpe_res;
+     /* Bdpe sent from receiver*/
+     unsigned int bdpe_tx_res;
+-    unsigned int btl_neck; /* Current bottle neck router length in mss's */
++    int btl_neck; /* Current bottle neck router length in mss's */
+     /* Current bottle neck router length residual (from previous division) */
+-    unsigned int btl_neck_res;
++    int btl_neck_res;
+     unsigned int link_capacity;  /* Current bottle neck link capacity */
+     /* Keep track of link capacity divison residual for accurate link_capacity calculation */
+     unsigned int link_capacity_res;
+@@ -107,6 +117,7 @@
+     unsigned int svc_var_push_err;  /* Error inserting variance values in fifo averager */
+     unsigned int utl;  /* Current bottle neck utilization  */
+     tcp_bw_est_type_t est_mode;   /* Type of estimation mode */
++    unsigned int cont_delta_hist[7];
+ 
+ }bw_est_stats_t;
+ 
+@@ -189,7 +200,8 @@
+ static
+ inline pkt_series_t * __bw_est_fifo_peek_last_series (avg_fifo_t *fifo_p) {
+     pkt_series_t *wr_entry = (pkt_series_t *)fifo_p->array;
+-    return &(wr_entry[fifo_p->wr]);
++    unsigned int wr = fifo_dec(fifo_p->wr, BW_EST_AVG_WINDOW_SIZE);
++    return &(wr_entry[wr]);
+ }
+ 
+ /* Circular buffer where oldest entries are over written
+@@ -208,7 +220,7 @@
+        fifo_p->count++;
+     }
+     /* Add entry */
+-    memcpy (&wr_entry[fifo_p->wr], pkt_series_p, sizeof(fifo_p->array[fifo_p->wr]));
++    memcpy (&wr_entry[fifo_p->wr], pkt_series_p, sizeof(*pkt_series_p));
+     fifo_p->wr = fifo_inc(fifo_p->wr, BW_EST_AVG_WINDOW_SIZE);
+     return 1;
+ }
+@@ -241,7 +253,7 @@
+     fifo_p->accum += pkt_series_p->delta;
+ 
+     /* Add packet and adjust average */
+-    memcpy (&array[fifo_p->wr], pkt_series_p, sizeof(array[fifo_p->wr]));
++    memcpy (&array[fifo_p->wr], pkt_series_p, sizeof(*pkt_series_p));
+ 
+     fifo_p->wr = fifo_inc(fifo_p->wr, BW_EST_AVG_WINDOW_SIZE);
+     return 1;
+@@ -257,22 +269,26 @@
+ {
+    intvl_series_t *array = (intvl_series_t *)fifo_p->array;
+     if (likely (bw_est_fifo_full(fifo_p))) {
+-        /* Remove oldest entry from accumulator. */
+-        if (fifo_p->accum < array[fifo_p->rd].est_bl) {
+-            /* Log error */
+-            return 0;
+-        } else {
+-           fifo_p->accum -= array[fifo_p->rd].est_bl;
+-           fifo_p->rd = fifo_inc(fifo_p->rd, BW_EST_AVG_WINDOW_SIZE);
+-        }
++//        printk(KERN_ERR"*s=%d bl=%d\n", fifo_p->saccum,
++//              array[fifo_p->rd].est_bl);
++        fifo_p->saccum -= array[fifo_p->rd].est_bl;
++//        printk(KERN_ERR"**s=%d bl=%d\n", fifo_p->saccum,
++//              array[fifo_p->rd].est_bl);
++        fifo_p->rd = fifo_inc(fifo_p->rd, BW_EST_AVG_WINDOW_SIZE);
+     } else {
+        fifo_p->count++;
+     }
+     /* Add packet and adjust average */
+-    memcpy (&array[fifo_p->wr], intvl_series_p, sizeof(array[fifo_p->wr]));
++    memcpy (&array[fifo_p->wr], intvl_series_p, sizeof(*intvl_series_p));
+     /* Add new value */
+-    fifo_p->accum += intvl_series_p->est_bl;
+-    fifo_p->wr = fifo_inc(fifo_p->wr, BW_EST_AVG_WINDOW_SIZE);
++//    printk(KERN_ERR"***s=%d wbl=%d\n", fifo_p->saccum,
++//              array[fifo_p->wr].est_bl);
++    fifo_p->saccum += intvl_series_p->est_bl;
++    array[fifo_p->wr].accum = fifo_p->saccum;
++//    printk(KERN_ERR"****s=%d wbl=%d\n", fifo_p->saccum,
++//              intvl_series_p->est_bl);
++    fifo_p->wr = fifo_inc(fifo_p->wr
++          , BW_EST_AVG_WINDOW_SIZE);
+ 
+     return 1;
+ }
+@@ -307,4 +323,44 @@
+     return 1;
+ }
+ 
++#define TCP_BW_IS_ACTIVE(tp) (likely(tp->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE))
++
++static inline unsigned int tcp_bw_get_stamp_us (void) {
++    struct timeval tv;
++    unsigned int us;
++    do_gettimeofday(&tv);
++    /* Time is truncated to unsigned int size */
++    us = tv.tv_sec * 1000000 + tv.tv_usec;
++//    printk(KERN_ERR"%s: us=%u sec=%u usec=%u t=%u\n",
++//             __FUNCTION__, us, tv.tv_sec, tv.tv_usec, tv.tv_sec * 1000000);
++    return us;
++}
++
++static inline unsigned int tcp_bw_get_skb_stamp_us (const struct sk_buff *skb) {
++    struct timeval tv;
++    unsigned int us;
++    skb_get_timestamp(skb, &tv);
++    /* Time is truncated to unsigned int size */
++    us = tv.tv_sec * 1000000 + tv.tv_usec;
++//    printk(KERN_ERR"%s: us=%u sec=%u usec=%u t=%u\n",
++//             __FUNCTION__, us, tv.tv_sec, tv.tv_usec, tv.tv_sec * 1000000);
++    return us;
++}
++
++
++/*
++ * Print packet series samples
++ */
++void tcp_bw_est_print_pkt_series (struct tcp_sock *tp);
++
++/*
++ * Print interval packet series samples
++ */
++void tcp_bw_est_print_intvl_series (struct tcp_sock *tp);
++
++/*
++ * Print continuous series samples
++ */
++void tcp_bw_est_print_cont_series (struct tcp_sock *tp);
++
+ #endif /* _TCP_BW_EST_ */
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/include/net/request_sock.h linux-3.12.38.modified/include/net/request_sock.h
+--- linux-3.12.38/include/net/request_sock.h	2015-02-16 10:15:42.000000000 -0500
++++ linux-3.12.38.modified/include/net/request_sock.h	2015-07-06 22:31:04.146525350 -0400
+@@ -57,6 +57,7 @@
+ 	u32				window_clamp; /* window clamp at creation time */
+ 	u32				rcv_wnd;	  /* rcv_wnd offered first time */
+ 	u32				ts_recent;
++	u32         ts_recent_us;  /* ts recent in micro secs */
+ 	unsigned long			expires;
+ 	const struct request_sock_ops	*rsk_ops;
+ 	struct sock			*sk;
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/include/net/tcp.h linux-3.12.38.modified/include/net/tcp.h
+--- linux-3.12.38/include/net/tcp.h	2015-07-07 22:02:58.489785981 -0400
++++ linux-3.12.38.modified/include/net/tcp.h	2015-07-06 22:31:04.150525350 -0400
+@@ -1121,6 +1121,7 @@
+ 	tcp_rsk(req)->snt_synack = 0;
+ 	req->mss = rx_opt->mss_clamp;
+ 	req->ts_recent = rx_opt->saw_tstamp ? rx_opt->rcv_tsval : 0;
++	req->ts_recent_us = rx_opt->saw_tstamp ? rx_opt->rcv_tsval_us : 0;
+ 	ireq->tstamp_ok = rx_opt->tstamp_ok;
+ 	ireq->sack_ok = rx_opt->sack_ok;
+ 	ireq->snd_wscale = rx_opt->snd_wscale;
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/net/ipv4/proc.c linux-3.12.38.modified/net/ipv4/proc.c
+--- linux-3.12.38/net/ipv4/proc.c	2015-02-16 10:15:42.000000000 -0500
++++ linux-3.12.38.modified/net/ipv4/proc.c	2015-07-07 21:55:13.317765693 -0400
+@@ -108,6 +108,7 @@
+ 	SNMP_MIB_ITEM("FragOKs", IPSTATS_MIB_FRAGOKS),
+ 	SNMP_MIB_ITEM("FragFails", IPSTATS_MIB_FRAGFAILS),
+ 	SNMP_MIB_ITEM("FragCreates", IPSTATS_MIB_FRAGCREATES),
++	//SNMP_MIB_ITEM("OutXmit", IPSTATS_MIB_OUTXMIT),
+ 	SNMP_MIB_SENTINEL
+ };
+ 
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/net/ipv4/tcp.c linux-3.12.38.modified/net/ipv4/tcp.c
+--- linux-3.12.38/net/ipv4/tcp.c	2015-07-07 22:02:58.473785980 -0400
++++ linux-3.12.38.modified/net/ipv4/tcp.c	2015-07-06 22:40:57.042551208 -0400
+@@ -2228,6 +2228,7 @@
+ 		}
+ 	}
+ 
++	tcp_bw_est_print_intvl_series(tcp_sk(sk));
+ 	if (sk->sk_state == TCP_CLOSE) {
+ 		struct request_sock *req = tcp_sk(sk)->fastopen_rsk;
+ 		/* We could get here with a non-NULL req if the socket is
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/net/ipv4/tcp_bw_est.c linux-3.12.38.modified/net/ipv4/tcp_bw_est.c
+--- linux-3.12.38/net/ipv4/tcp_bw_est.c	2015-07-07 22:02:58.489785981 -0400
++++ linux-3.12.38.modified/net/ipv4/tcp_bw_est.c	2015-07-06 22:31:04.186525352 -0400
+@@ -8,7 +8,6 @@
+ #include <net/tcp.h>
+ 
+ /* Local defines */
+-#define BW_EST_CONT_TH_US    100
+ 
+ /* Fuunction prototypes below */
+ 
+@@ -68,7 +67,7 @@
+        return ret;
+    }
+ 
+-   if (bw_est_fifo_init(&bw_est_p->intvl_series_fifo, bw_est_p->cont_series,
++   if (bw_est_fifo_init(&bw_est_p->intvl_series_fifo, bw_est_p->intvl_series,
+          BW_EST_AVG_WINDOW_SIZE)) {
+           printk(KERN_ERR"Error initializing interval series packets. "
+                 "Bw estimator will not be activated\n");
+@@ -137,11 +136,13 @@
+ #define TCP_BW_EST_UTIL_SCALE         (1ULL<<TCP_BW_EST_UTIL_SCALE_SHIFT)
+ /* Scale to the power of two */
+ #define TCP_BW_EST_UTIL_SCALE_POW2    (1ULL<<(TCP_BW_EST_UTIL_SCALE_SHIFT*2ULL))
++#define TCP_BW_EST_BL_SCALE_SHIFT     6UL
++#define TCP_BW_EST_BL_SCALE           (1UL<<TCP_BW_EST_BL_SCALE_SHIFT)
+ 
+ inline int tcp_bw_utlization_est(struct tcp_sock *tp)
+ {
+    int ret = -1;    /* Assume bw utilization calculation error */
+-   u64 bl = (u64)tp->bw_est_stats.btl_neck;
++   u64 bl = (u64)((tp->bw_est_stats.btl_neck < 0)? 0 : tp->bw_est_stats.btl_neck);
+    u64 tmp;
+ 
+    switch (tp->bw_est_stats.est_mode) {
+@@ -149,13 +150,16 @@
+            return ret;
+            break;
+        case TCP_BW_EST_TYPE_MD1:
+-           ret = (int)(TCP_BW_EST_UTIL_SCALE * (bl + 1) -
+-                 ll_sqrt( TCP_BW_EST_UTIL_SCALE_POW2*((bl*bl)+1) ));
++           ret = (int)(TCP_BW_EST_UTIL_SCALE * (bl + TCP_BW_EST_BL_SCALE) -
++                 ll_sqrt( TCP_BW_EST_UTIL_SCALE_POW2 * ((bl*bl)+
++                      TCP_BW_EST_BL_SCALE ) ));
++           ret = ret >> TCP_BW_EST_BL_SCALE_SHIFT;
+            break;
+        case TCP_BW_EST_TYPE_MM1:
+ 
+-           tmp = (bl * TCP_BW_EST_UTIL_SCALE) + tp->m_bw_est.mm1.util_res;
+-           tp->m_bw_est.mm1.util_res = __div64_32 (&tmp, bl + 1);
++           tmp = (bl * TCP_BW_EST_UTIL_SCALE) +
++              tp->m_bw_est.mm1.util_res;
++           tp->m_bw_est.mm1.util_res = __div64_32 (&tmp, bl + TCP_BW_EST_BL_SCALE);
+            ret = (int)tmp;
+ 
+            break;
+@@ -180,6 +184,7 @@
+ 
+            /* Hopefully, we have number that does not exceed  TCP_BW_EST_UTIL_SCALE */
+            ret = (int)div;
++           ret = ret >> TCP_BW_EST_BL_SCALE_SHIFT;
+        }
+ 
+           break;
+@@ -215,14 +220,14 @@
+         return -1;
+     }
+ 
+-
+-    bdpe_64 = TCP_BW_EST_UTIL_SCALE * tp->bw_est_stats.link_capacity
+-          * (TCP_BW_EST_UTIL_SCALE - util);
+-    bdpe_64 = (bdpe_64 >> TCP_BW_EST_UTIL_SCALE_SHIFT) *
+-          (tp->rcv_rtt_est.rtt >> 3);
++    /* scale * link (1 - p) = link ( scale - (scale * p) ) */
++    bdpe_64 = tp->bw_est_stats.link_capacity * (TCP_BW_EST_UTIL_SCALE - util);
++    bdpe_64 = ((bdpe_64 >> TCP_BW_EST_UTIL_SCALE_SHIFT) *
++          (jiffies_to_usecs(tp->rcv_rtt_est.rtt)>>3)) + tp->bw_est_stats.bdpe_res;
+     tp->bw_est_stats.bdpe_res = __div64_32 (&bdpe_64,
+-          inet_csk(sk)->icsk_ack.rcv_mss);
++          inet_csk(sk)->icsk_ack.rcv_mss * USEC_PER_SEC /* Normalizing rtt */);
+     tp->bw_est_stats.bdpe_tx = (u32)bdpe_64;
++    tp->bw_est_stats.tx_bw_found = 1;
+     tp->bw_est_stats.utl = util;
+ 
+     return 0;
+@@ -243,23 +248,49 @@
+    }
+    /* Get arrival delta mean. Window size is multiple
+     * of two */
+-   if (likely(bw_est_fifo_full(var_fifo_p))) {
+-         tp->bw_est_stats.svc_var_mean = (var_fifo_p->accum +
+-               tp->bw_est_stats.svc_var_mean_res) >> BW_EST_AVG_WINDOW_SIZE_SHIFT;
+-         tp->bw_est_stats.svc_var_mean_res = 0;
+-      } else {
+-          if (likely(var_fifo_p->count)) {
+-             unsigned int accum = var_fifo_p->accum + tp->bw_est_stats.svc_var_mean_res;
+-             tp->bw_est_stats.svc_var_mean = accum / var_fifo_p->count;
+-             tp->bw_est_stats.svc_var_mean_res = accum % var_fifo_p->count;
+-          } else {
+-             tp->bw_est_stats.svc_var_mean = var_fifo_p->accum + tp->bw_est_stats.svc_var_mean_res;
+-             tp->bw_est_stats.svc_var_mean_res = 0;
+-          }
+-      }
++   if (likely(var_fifo_p->count)) {
++       unsigned int accum = var_fifo_p->accum + tp->bw_est_stats.svc_var_mean_res;
++       tp->bw_est_stats.svc_var_mean = accum / var_fifo_p->count;
++       tp->bw_est_stats.svc_var_mean_res = accum % var_fifo_p->count;
++    } else {
++       tp->bw_est_stats.svc_var_mean = var_fifo_p->accum + tp->bw_est_stats.svc_var_mean_res;
++       tp->bw_est_stats.svc_var_mean_res = 0;
++    }
+     return 0;
+ }
+ 
++/*!
++ * Process continuous series delta histogram
++ * Classify continuous packet intervals on a specific histogram bin.
++ * Note: Not checking function arguments sanity for performance
++ * 		 considerations
++ *
++ * @return: 0 - Success classifying current delta. Otherwise, error
++ */
++int tcp_bw_est_process_cont (struct tcp_sock *tp, unsigned int delta_us)
++{
++
++
++	if (delta_us < 60) {
++		tp->bw_est_stats.cont_delta_hist[0]++;
++	} else if (delta_us < 80) {
++		tp->bw_est_stats.cont_delta_hist[1]++;
++	} else if (delta_us < 100) {
++		tp->bw_est_stats.cont_delta_hist[2]++;
++	} else if (delta_us < 140) {
++		tp->bw_est_stats.cont_delta_hist[3]++;
++	} else if (delta_us < 160) {
++		tp->bw_est_stats.cont_delta_hist[4]++;
++	} else if (delta_us < 200) {
++		tp->bw_est_stats.cont_delta_hist[5]++;
++	} else {
++		tp->bw_est_stats.cont_delta_hist[6]++;
++	}
++
++	return 0;
++}
++
++
+ /* Markov queue based bandwidth estimation algorithm. Collect data,
+  * analyze it and calculate approximate network capacity.
+  * return: 0 - Success processsing Markov based bandwidth estimation. Otherwise,
+@@ -271,16 +302,27 @@
+     pkt_series_t pkt_series; /* Samples received */
+     struct tcp_sock *tp = tcp_sk(sk);
+     avg_fifo_t *pkt_series_fifo_p = &tp->m_bw_est.pkt_series_fifo;
+-    struct timeval tv;
+ 
+     /* No checking for pointer sanity to improve performance */
+     /* Store current sent time. At this point, it is assume the system has
+      * detected and store a timestmap */
+-    do_gettimeofday(&tv);
+-    pkt_series.recvd = tv.tv_usec;
++
++//    pkt_series.recvd = tcp_bw_get_stamp_us();
++    pkt_series.recvd = tcp_bw_get_skb_stamp_us(skb);
++//    pkt_series.recvd = skb->h.th->seq;
++
+     pkt_series.sent = tp->rx_opt.rcv_tsval_us;
+-    printk(KERN_ERR"%s:pkts rx=%u tx=%u\n", __FUNCTION__, pkt_series.recvd,
+-       pkt_series.sent);
++
++    if (!TCP_BW_IS_ACTIVE(tp)) return 0;
++
++//    if (TCP_BW_IS_ACTIVE(tp)) {
++//         static unsigned int i = 0;
++//         if ((i % 50) == 0) {
++//             printk(KERN_ERR"send_cwnd=%u ssth=%u flight=%u\n", tp->snd_cwnd,
++//                   tp->snd_ssthresh, tcp_packets_in_flight(tp));
++//         }
++//         i++;
++//     }
+ 
+     if (likely (!bw_est_fifo_empty(pkt_series_fifo_p))) {
+         const struct inet_connection_sock *icsk = inet_csk(sk);
+@@ -288,43 +330,50 @@
+               __bw_est_fifo_peek_last_series(pkt_series_fifo_p);
+         /* No need to check for return pointer sanity for now */
+         /* Measure tx delta */
+-        unsigned delta = (unsigned int)((signed int)pkt_series.sent -
++        unsigned int delta_tx = (unsigned int)((signed int)pkt_series.sent -
+               (signed int)last_pkt_series_p->sent);
+         avg_fifo_t *intvl_series_fifo_p = &tp->m_bw_est.intvl_series_fifo;
+-        unsigned int cont_mean;
+-        unsigned int intvl_mean;
++        int cont_mean;
++        int intvl_mean;
++
++//        if (TCP_BW_IS_ACTIVE(tp)) {
++//            printk(KERN_ERR"%s:sent=%u last sent=%u d=%d\n", __FUNCTION__, pkt_series.sent,
++//              last_pkt_series_p->sent, delta);
++//        }
+ 
+-        if (delta < BW_EST_CONT_TH_US) {
++        /* TODO: Remove Change condition */
++        if (delta_tx > BW_EST_CONT_TH_US) {
+             avg_fifo_t *cont_series_fifo_p = &tp->m_bw_est.cont_series_fifo;
++            int cont_delta = pkt_series.recvd - last_pkt_series_p->recvd;
+             /* The packet is a continuous series */
+             cont_series_t cont_series;
+-            cont_series.prev_rx = last_pkt_series_p->sent;
++
++            tp->bw_est_stats.cont_hits++;
++            cont_series.prev_rx = last_pkt_series_p->recvd;
+             cont_series.rx = pkt_series.recvd;
+-            cont_series.delta = delta;
++            cont_series.delta = likely(cont_delta > 0)? cont_delta : 0;
+             if (unlikely (!bw_est_fifo_push_cont_series(cont_series_fifo_p, &cont_series))) {
+                 tp->bw_est_stats.cont_push_err++;
+                 return -1;
+             }
+             /* Get arrival delta mean. Window size is multiple
+              * of two */
+-            if (likely(bw_est_fifo_full(cont_series_fifo_p))) {
+-               tp->bw_est_stats.cont_mean = (cont_series_fifo_p->accum +
+-                     tp->bw_est_stats.cont_mean_res) >> BW_EST_AVG_WINDOW_SIZE_SHIFT;
+-               tp->bw_est_stats.cont_mean_res = 0;
++            if (likely(cont_series_fifo_p->count)) {
++                unsigned int accum = cont_series_fifo_p->accum + tp->bw_est_stats.cont_mean_res;
++                tp->bw_est_stats.cont_mean = accum / cont_series_fifo_p->count;
++                tp->bw_est_stats.cont_mean_res = accum % cont_series_fifo_p->count;
+             } else {
+-                if (likely(cont_series_fifo_p->count)) {
+-                   unsigned int accum = cont_series_fifo_p->accum + tp->bw_est_stats.cont_mean_res;
+-                   tp->bw_est_stats.cont_mean = accum / cont_series_fifo_p->count;
+-                   tp->bw_est_stats.cont_mean_res = accum % cont_series_fifo_p->count;
+-                } else {
+-                   tp->bw_est_stats.cont_mean = cont_series_fifo_p->accum + tp->bw_est_stats.cont_mean_res;
+-                   tp->bw_est_stats.cont_mean_res = 0;
+-                }
++                tp->bw_est_stats.cont_mean = cont_series_fifo_p->accum + tp->bw_est_stats.cont_mean_res;
++                tp->bw_est_stats.cont_mean_res = 0;
+             }
+ 
+             /* Calculate variance. Only executed in M/G/1 queue to save cpu cycles */
+-            if (tp->bw_est_stats.est_mode == TCP_BW_EST_TYPE_MG1)
+-                  tcp_bw_est_calc_var(tp, tp->bw_est_stats.cont_mean - cont_series.delta);
++            if (tp->bw_est_stats.est_mode == TCP_BW_EST_TYPE_MG1) {
++                tcp_bw_est_calc_var(tp, tp->bw_est_stats.cont_mean - cont_series.delta);
++            }
++
++            /* Process continuous series histogram. TODO: uncomment */
++//            tcp_bw_est_process_cont(tp, cont_series.delta);
+ 
+             /* Calculate bottleneck link speed. */
+             {
+@@ -339,48 +388,68 @@
+ 
+         } else {
+            /* The packet is a interval series */
++           unsigned int delta_rx;
++           int delta;
+            intvl_series_t intvl_series;
+            intvl_series.prev_rx = last_pkt_series_p->recvd;
+            intvl_series.rx = pkt_series.recvd;
+            intvl_series.prev_tx = last_pkt_series_p->sent;
+            intvl_series.tx = pkt_series.sent;
+            /* Taking in account u32 wrapping */
+-           intvl_series.est_bl = (unsigned int)
+-                 ((signed int)((signed int)intvl_series.rx - (signed int)intvl_series.prev_rx) -
+-                 (signed int)((signed int)intvl_series.tx - (signed int)intvl_series.prev_tx));
++           delta_rx = (unsigned int)((signed int)intvl_series.rx - (signed int)intvl_series.prev_rx);
++
++           // TODO: restore and remove code below
++//           delta = ((signed int)delta_rx - (signed int)delta_tx);
++           delta = delta_rx;
++
++//           if (delta < 0) {
++//              /* Invalid value, return */
++//              bw_est_fifo_push_pkt_series(pkt_series_fifo_p, &pkt_series);
++//              return 0;
++//           }
++//           else {intvl_series.est_bl = delta; }
++           {intvl_series.est_bl = delta; }
++//           if (TCP_BW_IS_ACTIVE(tp)) {
++//               static unsigned int i = 0;
++//               if ((i % 50) == 0) {
++//                   printk(KERN_ERR"%s: rx=%u prx=%u tx=%u ptx=%u cbl=%d drx=%u dtx=%u\n", __FUNCTION__, intvl_series.rx,
++//                   intvl_series.prev_rx, intvl_series.tx, intvl_series.prev_tx, intvl_series.est_bl,
++//                   delta_rx, delta_tx);
++//               }
++//           }
+ 
+            if (unlikely(!bw_est_fifo_push_intvl_series(intvl_series_fifo_p, &intvl_series))) {
+                tp->bw_est_stats.intvl_push_err++;
+                return -1;
+            }
+ 
+-           if (likely(bw_est_fifo_full(intvl_series_fifo_p))) {
+-              intvl_series_fifo_p->accum = (intvl_series_fifo_p->accum + tp->bw_est_stats.intvl_mean_res)
+-                     >> BW_EST_AVG_WINDOW_SIZE_SHIFT;
+-               tp->bw_est_stats.intvl_mean_res = 0;
+-           } else {
+-               if (likely(intvl_series_fifo_p->count)) {
+-                   unsigned int accum = intvl_series_fifo_p->accum + tp->bw_est_stats.intvl_mean_res;
+-                   tp->bw_est_stats.intvl_mean =  accum / intvl_series_fifo_p->count;
++           if (likely(intvl_series_fifo_p->count)) {
++                   int accum = intvl_series_fifo_p->saccum + tp->bw_est_stats.intvl_mean_res;
++                   tp->bw_est_stats.intvl_mean =  (signed)accum / (signed)intvl_series_fifo_p->count;
+                    tp->bw_est_stats.intvl_mean_res =
+                          accum % intvl_series_fifo_p->count;
+-               } else {
+-                   tp->bw_est_stats.intvl_mean = intvl_series_fifo_p->accum + tp->bw_est_stats.intvl_mean_res;
+-                   tp->bw_est_stats.intvl_mean_res = 0;
+-               }
++//                 printk(KERN_ERR"%s: intvl saccum=%d res=%d cnt=%d m=%d a=%d c=%d bl=%d\n", __FUNCTION__, intvl_series_fifo_p->saccum,
++//                       tp->bw_est_stats.intvl_mean_res, intvl_series_fifo_p->count, tp->bw_est_stats.intvl_mean, accum,
++//                       intvl_series_fifo_p->count, intvl_series.est_bl);
++           } else {
++               tp->bw_est_stats.intvl_mean = intvl_series_fifo_p->saccum + tp->bw_est_stats.intvl_mean_res;
++               tp->bw_est_stats.intvl_mean_res = 0;
+            }
++
++           tp->bw_est_stats.intvl_hits++;
+         }
+ 
+         cont_mean = tp->bw_est_stats.cont_mean;
+-        intvl_mean = tp->bw_est_stats.intvl_mean;
++        intvl_mean = (tp->bw_est_stats.intvl_mean < 0) ? 0 : tp->bw_est_stats.intvl_mean;
+         /* Calculate approximate router bottleneck packet count */
+         /* Get arrival delta mean. Window size is multiple
+          * of two */
+ 
+         {
+-        const unsigned int btl_neck = intvl_mean + tp->bw_est_stats.btl_neck_res;
+-        tp->bw_est_stats.btl_neck = btl_neck / likely(cont_mean)? cont_mean : 1;
+-        tp->bw_est_stats.btl_neck_res = btl_neck % cont_mean;
++        const int btl_neck = (intvl_mean + tp->bw_est_stats.btl_neck_res) * TCP_BW_EST_BL_SCALE;
++        tp->bw_est_stats.btl_neck = (signed)btl_neck / (signed)(likely(cont_mean)? cont_mean : 1);
++        tp->bw_est_stats.btl_neck_res = (signed)btl_neck % (signed)cont_mean;
++
+         }
+ 
+         /* Estimate available bandwidth */
+@@ -390,5 +459,208 @@
+     bw_est_fifo_push_pkt_series(pkt_series_fifo_p, &pkt_series);
+     /* Find the send delta */
+ 
+-    return ret;
++    return 0;
++}
++
++#define BYTES_PER_ASCII 2
++#define NIBBLES_PER_BYTE 2
++/*
++ * Print packet series samples
++ */
++void tcp_bw_est_print_pkt_series (struct tcp_sock *tp)
++{
++
++    if (TCP_BW_IS_ACTIVE(tp)) {
++       /* Should be less than BW_EST_AVG_WINDOW_SIZE */
++#define PKT_SAMPLES_PER_PRINTED_LINE   (BW_EST_AVG_WINDOW_SIZE>>7)
++#define PKT_STRING_FORMAT "idx=%u tx=%u rx=%u "
++
++        unsigned int i = 0;
++        unsigned char str [] = {PKT_STRING_FORMAT};
++        unsigned char *buf = (unsigned char *)
++              kmalloc(PKT_SAMPLES_PER_PRINTED_LINE * sizeof(u32) *
++              BYTES_PER_ASCII * sizeof(str) * 3 /* rx, tx, and idx numbers */
++              * NIBBLES_PER_BYTE * 4 /* Extra space */,
++              GFP_ATOMIC);
++        int len = 0; /* Chars written */
++        pkt_series_t *pkt_series_p = &tp->m_bw_est.pkt_series[0];
++
++        if (!buf) {
++            printk(KERN_ERR"%s: Error, could not allocate print memory\n", __FUNCTION__);
++            return;
++        }
++        if (!tp) {
++            printk(KERN_ERR"%s: Error, invalid tcp socket pointer\n", __FUNCTION__);
++            return;
++        }
++        for (; i < BW_EST_AVG_WINDOW_SIZE; i++) {
++            len += sprintf (buf + len, PKT_STRING_FORMAT, i, pkt_series_p[i].sent,
++                  pkt_series_p[i].recvd);
++            if (i && ((i % (PKT_SAMPLES_PER_PRINTED_LINE - 1)) == 0)) {
++                printk(KERN_ERR "%s\n", buf);
++                len = 0; /* Reset print offset */
++
++            }
++        }
++        printk(KERN_ERR"%s: xih=%d ch=%d h0=%d h1=%d h2=%d h3=%d h4=%d h5=%d h6=%d\n", __FUNCTION__,
++         tp->bw_est_stats.intvl_hits, tp->bw_est_stats.cont_hits,
++         tp->bw_est_stats.cont_delta_hist[0], tp->bw_est_stats.cont_delta_hist[1],
++         tp->bw_est_stats.cont_delta_hist[2], tp->bw_est_stats.cont_delta_hist[3], tp->bw_est_stats.cont_delta_hist[4],
++         tp->bw_est_stats.cont_delta_hist[5], tp->bw_est_stats.cont_delta_hist[6]);
++        kfree(buf);
++    }
++}
++
++/*
++ * Print continuous series samples
++ */
++void tcp_bw_est_print_cont_series (struct tcp_sock *tp)
++{
++    if (TCP_BW_IS_ACTIVE(tp)) {
++       /* Should be less than BW_EST_AVG_WINDOW_SIZE */
++#define CONT_SAMPLES_PER_PRINTED_LINE   (BW_EST_AVG_WINDOW_SIZE>>5)
++//#define CONT_STRING_FORMAT "idx=%u prx=%u rx=%u d=%u "
++#define CONT_STRING_FORMAT "-idx=%u d=%u "
++
++        unsigned int i = 0;
++        unsigned char str [] = {PKT_STRING_FORMAT};
++        unsigned char *buf = (unsigned char *)
++              kmalloc(PKT_SAMPLES_PER_PRINTED_LINE * sizeof(u32) *
++              BYTES_PER_ASCII * sizeof(str) * 4 /* prev rx, rx, delta and idx numbers */
++              * NIBBLES_PER_BYTE * 4 /* Extra space */,
++              GFP_ATOMIC);
++        int len = 0; /* Chars written */
++        cont_series_t *cont_series_p = &tp->m_bw_est.cont_series[0];
++
++        if (!buf) {
++            printk(KERN_ERR"%s: Error, could not allocate print memory\n", __FUNCTION__);
++            return;
++        }
++        if (!tp) {
++            printk(KERN_ERR"%s: Error, invalid tcp socket pointer\n", __FUNCTION__);
++            return;
++        }
++        for (; i < BW_EST_AVG_WINDOW_SIZE; i++) {
++//            len += sprintf (buf + len, CONT_STRING_FORMAT, i, cont_series_p[i].prev_rx,
++//                  cont_series_p[i].rx, cont_series_p[i].delta);
++            len += sprintf (buf + len, CONT_STRING_FORMAT, i, cont_series_p[i].delta);
++            if (i && ((i % (CONT_SAMPLES_PER_PRINTED_LINE - 1)) == 0)) {
++                printk(KERN_ERR "%s\n", buf);
++                len = 0; /* Reset print offset */
++
++            }
++        }
++        printk(KERN_ERR"%s: ih=%d ch=%d h0=%d h1=%d h2=%d h3=%d h4=%d h5=%d h6=%d\n", __FUNCTION__,
++         tp->bw_est_stats.intvl_hits, tp->bw_est_stats.cont_hits,
++         tp->bw_est_stats.cont_delta_hist[0], tp->bw_est_stats.cont_delta_hist[1],
++         tp->bw_est_stats.cont_delta_hist[2], tp->bw_est_stats.cont_delta_hist[3], tp->bw_est_stats.cont_delta_hist[4],
++         tp->bw_est_stats.cont_delta_hist[5], tp->bw_est_stats.cont_delta_hist[6]);
++        kfree(buf);
++    }
+ }
++
++/*
++ * Print interval packet series samples
++ */
++void tcp_bw_est_print_intvl_series (struct tcp_sock *tp) {
++
++    if (TCP_BW_IS_ACTIVE(tp)) {
++        /* Should be less than BW_EST_AVG_WINDOW_SIZE */
++#define INTVL_SAMPLES_PER_PRINTED_LINE   (BW_EST_AVG_WINDOW_SIZE>>6)
++//#define INTVL_STRING_FORMAT "idx=%u tx=%u txprev=%u rx=%u rxprev=%u d=%d a=%d "
++#define INTVL_STRING_FORMAT "rd=%u tx=%u "
++
++        unsigned int i = 0;
++        unsigned char str [] = {INTVL_STRING_FORMAT};
++        unsigned char *buf = (unsigned char *)
++              kmalloc(INTVL_SAMPLES_PER_PRINTED_LINE * (sizeof(u32) *
++                    /* rx, tx, rxprev, txprev, idx, accum and delta numbers */
++                    BYTES_PER_ASCII * NIBBLES_PER_BYTE * 6)
++                    + sizeof(str) + 4 /* Extra space */,
++              GFP_ATOMIC);
++        int len = 0; /* Chars written */
++        intvl_series_t *intvl_series_p = &tp->m_bw_est.intvl_series[0];
++
++        if (!buf) {
++            printk(KERN_ERR"%s: Error, could not allocate print memory\n", __FUNCTION__);
++            return;
++        }
++        if (!tp) {
++            printk(KERN_ERR"%s: Error, invalid tcp socket pointer\n", __FUNCTION__);
++            return;
++        }
++
++        for (; i < BW_EST_AVG_WINDOW_SIZE; i++) {
++//            len += sprintf (buf + len, INTVL_STRING_FORMAT, i, intvl_series_p[i].tx,
++//                  intvl_series_p[i].prev_tx, intvl_series_p[i].rx,
++//                  intvl_series_p[i].prev_rx, intvl_series_p[i].est_bl,
++//                  intvl_series_p[i].accum);
++            len += sprintf (buf + len, INTVL_STRING_FORMAT, intvl_series_p[i].est_bl,
++                  intvl_series_p[i].prev_tx);
++            if (i && ((i % (INTVL_SAMPLES_PER_PRINTED_LINE - 1)) == 0)) {
++                printk(KERN_ERR "%s\n", buf);
++                len = 0; /* Reset print offset */
++
++            }
++        }
++        printk(KERN_ERR"%s: ih=%d ch=%d h0=%d h1=%d h2=%d h3=%d h4=%d h5=%d h6=%d\n", __FUNCTION__,
++         tp->bw_est_stats.intvl_hits, tp->bw_est_stats.cont_hits,
++         tp->bw_est_stats.cont_delta_hist[0], tp->bw_est_stats.cont_delta_hist[1],
++         tp->bw_est_stats.cont_delta_hist[2], tp->bw_est_stats.cont_delta_hist[3], tp->bw_est_stats.cont_delta_hist[4],
++         tp->bw_est_stats.cont_delta_hist[5], tp->bw_est_stats.cont_delta_hist[6]);
++        kfree(buf);
++    }
++}
++
++/*
++ * Print packet series samples
++ */
++void tcp_bw_est_print_series (struct tcp_sock *tp) {
++
++    if (TCP_BW_IS_ACTIVE(tp)) {
++        /* Should be less than BW_EST_AVG_WINDOW_SIZE */
++#define SAMPLES_PER_PRINTED_LINE   (BW_EST_AVG_WINDOW_SIZE>>6)
++#define STRING_FORMAT "idx=%u tx=%u rx=%u "
++//#define INTVL_STRING_FORMAT "d=%d a=%d "
++
++        unsigned int i = 0;
++        unsigned char str [] = {STRING_FORMAT};
++        unsigned char *buf = (unsigned char *)
++              kmalloc(SAMPLES_PER_PRINTED_LINE * (sizeof(u32) *
++                    /* rx, tx, rxprev, txprev, idx, accum and delta numbers */
++                    BYTES_PER_ASCII * NIBBLES_PER_BYTE * 6)
++                    + sizeof(str) + 4 /* Extra space */,
++              GFP_ATOMIC);
++        int len = 0; /* Chars written */
++        pkt_series_t *pkt_series_p = &tp->m_bw_est.pkt_series[0];
++
++        if (!buf) {
++            printk(KERN_ERR"%s: Error, could not allocate print memory\n", __FUNCTION__);
++            return;
++        }
++        if (!tp) {
++            printk(KERN_ERR"%s: Error, invalid tcp socket pointer\n", __FUNCTION__);
++            return;
++        }
++
++        for (; i < BW_EST_AVG_WINDOW_SIZE; i++) {
++            len += sprintf (buf + len, STRING_FORMAT, i,
++                  pkt_series_p[i].sent, pkt_series_p[i].recvd);
++//            len += sprintf (buf + len, INTVL_STRING_FORMAT, intvl_series_p[i].est_bl,
++//                  intvl_series_p[i].accum);
++            if (i && ((i % (SAMPLES_PER_PRINTED_LINE - 1)) == 0)) {
++                printk(KERN_ERR "%s\n", buf);
++                len = 0; /* Reset print offset */
++
++            }
++        }
++
++        printk(KERN_ERR"%s: ih=%d ch=%d h0=%d h1=%d h2=%d h3=%d h4=%d h5=%d h6=%d\n", __FUNCTION__,
++         tp->bw_est_stats.intvl_hits, tp->bw_est_stats.cont_hits,
++         tp->bw_est_stats.cont_delta_hist[0], tp->bw_est_stats.cont_delta_hist[1],
++         tp->bw_est_stats.cont_delta_hist[2], tp->bw_est_stats.cont_delta_hist[3], tp->bw_est_stats.cont_delta_hist[4],
++         tp->bw_est_stats.cont_delta_hist[5], tp->bw_est_stats.cont_delta_hist[6]);
++        kfree(buf);
++    }
++}
++
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/net/ipv4/tcp_input.c linux-3.12.38.modified/net/ipv4/tcp_input.c
+--- linux-3.12.38/net/ipv4/tcp_input.c	2015-07-07 22:02:58.493785981 -0400
++++ linux-3.12.38.modified/net/ipv4/tcp_input.c	2015-07-07 21:28:09.865694891 -0400
+@@ -501,10 +501,19 @@
+ 					  const struct sk_buff *skb)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
++	unsigned int time_stamp;
++
++	if (TCP_BW_IS_ACTIVE(tp)) {
++	    time_stamp = tcp_bw_get_stamp_us() / 1000;
++//	    printk(KERN_ERR"%s: ts=%u secr=%u\n", __FUNCTION__, time_stamp, tp->rx_opt.rcv_tsecr);
++	} else {
++	    time_stamp = tcp_time_stamp;
++	}
++
+ 	if (tp->rx_opt.rcv_tsecr &&
+ 	    (TCP_SKB_CB(skb)->end_seq -
+ 	     TCP_SKB_CB(skb)->seq >= inet_csk(sk)->icsk_ack.rcv_mss))
+-		tcp_rcv_rtt_update(tp, tcp_time_stamp - tp->rx_opt.rcv_tsecr, 0);
++		tcp_rcv_rtt_update(tp, time_stamp - tp->rx_opt.rcv_tsecr, 0);
+ }
+ 
+ /*
+@@ -654,6 +663,9 @@
+ 	if (tp->srtt != 0) {
+ 		m -= (tp->srtt >> 3);	/* m is now error in rtt est */
+ 		tp->srtt += m;		/* rtt = 7/8 rtt + 1/8 new */
++//		if (TCP_BW_IS_ACTIVE(tp)) {
++//          printk(KERN_ERR"%s: -srtt=%u\n", __FUNCTION__, tp->srtt);
++//      }
+ 		if (m < 0) {
+ 			m = -m;		/* m is now abs(error) */
+ 			m -= (tp->mdev >> 2);   /* similar update on mdev */
+@@ -2244,9 +2256,16 @@
+  */
+ static inline bool tcp_packet_delayed(const struct tcp_sock *tp)
+ {
++	if (TCP_BW_IS_ACTIVE(tp)) {
++		return !tp->retrans_stamp ||
++			(tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr_us &&
++			before(tp->rx_opt.rcv_tsecr_us, tp->retrans_stamp));
++    }
++    else {
+ 	return !tp->retrans_stamp ||
+ 		(tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr &&
+ 		 before(tp->rx_opt.rcv_tsecr, tp->retrans_stamp));
++    }
+ }
+ 
+ /* Undo procedures. */
+@@ -2855,8 +2874,14 @@
+ 	 * See draft-ietf-tcplw-high-performance-00, section 3.3.
+ 	 */
+ 	if (seq_rtt < 0 && tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr &&
+-	    flag & FLAG_ACKED)
+-		seq_rtt = tcp_time_stamp - tp->rx_opt.rcv_tsecr;
++	    flag & FLAG_ACKED){
++		if (TCP_BW_IS_ACTIVE(tp)) {
++			const unsigned int tmp_rtt = tcp_bw_get_stamp_us();
++        		seq_rtt = (tmp_rtt/1000) - tp->rx_opt.rcv_tsecr_us;
++		} else {
++           		seq_rtt = tcp_time_stamp - tp->rx_opt.rcv_tsecr;
++		}
++	}
+ 
+ 	if (seq_rtt < 0)
+ 		return false;
+@@ -2875,8 +2900,14 @@
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	s32 seq_rtt = -1;
+ 
+-	if (synack_stamp && !tp->total_retrans)
+-		seq_rtt = tcp_time_stamp - synack_stamp;
++	if (synack_stamp && !tp->total_retrans) {
++		if (TCP_BW_IS_ACTIVE(tp)) {
++                        const unsigned int tmp_rtt = tcp_bw_get_stamp_us();
++                        seq_rtt = (tmp_rtt/1000) - synack_stamp;
++                } else {
++			seq_rtt = tcp_time_stamp - synack_stamp;
++                }	
++	}
+ 
+ 	/* If the ACK acks both the SYNACK and the (Fast Open'd) data packets
+ 	 * sent in SYN_RECV, SYNACK RTT is the smooth RTT computed in tcp_ack()
+@@ -3259,6 +3290,7 @@
+ static void tcp_store_ts_recent(struct tcp_sock *tp)
+ {
+ 	tp->rx_opt.ts_recent = tp->rx_opt.rcv_tsval;
++	tp->rx_opt.ts_recent_us = tp->rx_opt.rcv_tsval_us;
+ 	tp->rx_opt.ts_recent_stamp = get_seconds();
+ }
+ 
+@@ -3586,7 +3618,7 @@
+ 			  | (TCPOPT_TIMESTAMP << 8) | TCPOLEN_TIMESTAMP)) {
+ 		tp->rx_opt.saw_tstamp = 1;
+ 		++ptr;
+-		if (tp->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE){
++		if (TCP_BW_IS_ACTIVE(tp)){
+ 			tp->rx_opt.rcv_tsval_us = ntohl(*ptr);
+        			tp->rx_opt.rcv_tsval = tp->rx_opt.rcv_tsval_us / 1000;   /* Transform to ms */
+               		++ptr;
+@@ -3619,7 +3651,7 @@
+ 				   const struct tcphdr *th, struct tcp_sock *tp)
+ {
+ 	int bw_est_en = 0;  /* Assume no bw est enabled */
+-	if (tp->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE)
++	if (TCP_BW_IS_ACTIVE(tp))
+ 		bw_est_en = 1;
+ 	/* In the spirit of fast parsing, compare doff directly to constant
+ 	 * values.  Because equality is used, short doff can be ignored here.
+@@ -5076,6 +5108,8 @@
+ static inline unsigned int
+ tcp_rcv_get_est_bw(const struct tcphdr *th)
+ {
++//    printk(KERN_ERR"recv rate=%u nts=%u res=%u tr=%u\n", (unsigned int)th->urg_ptr, (unsigned int)ntohs(th->urg_ptr),
++//          th->res1, ((unsigned int)ntohs(th->urg_ptr) | (th->res1 << TCP_URG_PTR_SHIFT)));
+     return ((unsigned int)ntohs(th->urg_ptr) | (th->res1 << TCP_URG_PTR_SHIFT));
+ }
+ 
+@@ -5099,7 +5133,8 @@
+     if (!tp->m_bw_est.processed) {
+         if (tp->rx_opt.saw_tstamp) {
+            process_bw = 1;
+-        } else {
++        }
++        else {
+             /* Slow. Try to collect time stamp */
+             tcp_fast_parse_options(skb, th, tp);
+             if (tp->rx_opt.saw_tstamp) {
+@@ -5163,13 +5198,13 @@
+ 	 *	extra cost of the net_bh soft interrupt processing...
+ 	 *	We do checksum and copy also but from device to kernel.
+ 	 */
+-
++//	if (TCP_BW_IS_ACTIVE(tp)) {
++//          printk(KERN_ERR"%s: * w=0x%X b=0x%X pf=0x%X seq=%d n=%d tp=%u\n", __FUNCTION__,
++//                tcp_flag_word(th), TCP_HP_BITS, tp->pred_flags, TCP_SKB_CB(skb)->seq,
++//                tp->rcv_nxt, (unsigned int)tp);
++//   }
+ 	tp->rx_opt.saw_tstamp = 0;
+ 
+-	if (likely(tp->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE)) {
+-	    printk(KERN_ERR"%s\n", __FUNCTION__);
+-	}
+-
+ 	/*	pred_flags is 0xS?10 << 16 + snd_wnd
+ 	 *	if header_prediction is to be made
+ 	 *	'S' will always be tp->tcp_header_len >> 2
+@@ -5179,7 +5214,7 @@
+ 	 *	PSH and URGflags are ignored.
+ 	 */
+ 
+-	tp->m_bw_est.processed = 0; /* Bandwidth estimation has not bee processed */
++	tp->m_bw_est.processed = 0; /* Bandwidth estimation has not been processed */
+ 
+ 	if ((tcp_flag_word(th) & TCP_HP_BITS) == tp->pred_flags &&
+ 	    TCP_SKB_CB(skb)->seq == tp->rcv_nxt &&
+@@ -5221,9 +5256,11 @@
+ 					tcp_store_ts_recent(tp);
+ 
+ 				/* Set bw from the receiver */
+-				if ((tp->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE) &&
+-				      th->urg)
++				if (TCP_BW_IS_ACTIVE(tp) &&
++				      th->urg) {
+ 				    tp->bw_est_stats.bdpe_rx = tcp_rcv_get_est_bw(th);
++//				    printk(KERN_ERR"*1- %u\n", tp->bw_est_stats.bdpe_rx);
++				}
+ 
+ 				/* We know that such packets are checksummed
+ 				 * on entry.
+@@ -5353,7 +5390,7 @@
+ 		goto discard;
+ 
+ 	/* Set bw from the receiver */
+-	if ((tp->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE) &&
++	if ((TCP_BW_IS_ACTIVE(tp)) &&
+ 			th->urg)
+ 		tp->bw_est_stats.bdpe_rx = tcp_rcv_get_est_bw(th);
+ 
+@@ -5435,7 +5472,7 @@
+ 		tcp_clear_options(&opt);
+ 		opt.user_mss = opt.mss_clamp = 0;
+ 		tcp_parse_options(synack, &opt, 0, NULL,
+-				(tp->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE));
++				(TCP_BW_IS_ACTIVE(tp)));
+ 		mss = opt.mss_clamp;
+ 	}
+ 
+@@ -5472,7 +5509,7 @@
+ 	int saved_clamp = tp->rx_opt.mss_clamp;
+ 
+ 	tcp_parse_options(skb, &tp->rx_opt, 0, &foc,
+-			(tp->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE));
++			(TCP_BW_IS_ACTIVE(tp)));
+ 	if (tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr)
+ 		tp->rx_opt.rcv_tsecr -= tp->tsoffset;
+ 
+@@ -5489,6 +5526,26 @@
+ 		    after(TCP_SKB_CB(skb)->ack_seq, tp->snd_nxt))
+ 			goto reset_and_undo;
+ 
++		{
++		u32 when;
++		if (TCP_BW_IS_ACTIVE(tp)) {
++			when = tcp_bw_get_stamp_us();
++			if (tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr_us &&
++				!between(tp->rx_opt.rcv_tsecr_us, tp->retrans_stamp, when)) {
++				NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_PAWSACTIVEREJECTED);
++				goto reset_and_undo;
++			}
++		} else {
++           		when = tcp_time_stamp;
++			if (tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr &&
++				!between(tp->rx_opt.rcv_tsecr, tp->retrans_stamp, when)) {
++				NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_PAWSACTIVEREJECTED);
++				goto reset_and_undo;
++           		}
++
++		}
++		}
++
+ 		if (tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr &&
+ 		    !between(tp->rx_opt.rcv_tsecr, tp->retrans_stamp,
+ 			     tcp_time_stamp)) {
+@@ -5748,7 +5805,7 @@
+ 			return queued;
+ 
+ 		/* Do step6 onward by hand. */
+-		if (unlikely(1)) {/* Not used for testing purposes */
++		if (likely(0)) {/* Not used for testing purposes */
+ 		   tcp_urg(sk, skb, th);
+ 		}
+ 
+@@ -5920,7 +5977,7 @@
+ 	}
+ 
+ 	/* step 6: check the URG bit */
+-	if (unlikely(1)) { /* Not used for tesing purposes */
++	if (likely(0)) { /* Not used for tesing purposes */
+ 	   tcp_urg(sk, skb, th);
+ 	}
+ 
+@@ -5929,7 +5986,7 @@
+ 	case TCP_CLOSE_WAIT:
+ 	case TCP_CLOSING:
+ 	case TCP_LAST_ACK:
+-		if (!before(TCP_SKB_CB(skb)->seq, tp->rcv_nxt))
++	   if (!before(TCP_SKB_CB(skb)->seq, tp->rcv_nxt))
+ 			break;
+ 	case TCP_FIN_WAIT1:
+ 	case TCP_FIN_WAIT2:
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/net/ipv4/tcp_minisocks.c linux-3.12.38.modified/net/ipv4/tcp_minisocks.c
+--- linux-3.12.38/net/ipv4/tcp_minisocks.c	2015-07-07 22:02:58.497785981 -0400
++++ linux-3.12.38.modified/net/ipv4/tcp_minisocks.c	2015-07-07 21:53:35.853761443 -0400
+@@ -516,7 +516,7 @@
+ 	tmp_opt.saw_tstamp = 0;
+ 	if (th->doff > (sizeof(struct tcphdr)>>2)) {
+ 		tcp_parse_options(skb, &tmp_opt, 0, NULL,
+-				(tcp_sk(sk)->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE));
++				TCP_BW_IS_ACTIVE(tcp_sk(sk)));
+ 
+ 		if (tmp_opt.saw_tstamp) {
+ 			tmp_opt.ts_recent = req->ts_recent;
+@@ -643,8 +643,10 @@
+ 
+ 	/* In sequence, PAWS is OK. */
+ 
+-	if (tmp_opt.saw_tstamp && !after(TCP_SKB_CB(skb)->seq, tcp_rsk(req)->rcv_nxt))
++	if (tmp_opt.saw_tstamp && !after(TCP_SKB_CB(skb)->seq, tcp_rsk(req)->rcv_nxt)){
+ 		req->ts_recent = tmp_opt.rcv_tsval;
++		req->ts_recent_us = tmp_opt.rcv_tsval_us;
++	}
+ 
+ 	if (TCP_SKB_CB(skb)->seq == tcp_rsk(req)->rcv_isn) {
+ 		/* Truncate SYN, it is out of window starting
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/net/ipv4/tcp_output.c linux-3.12.38.modified/net/ipv4/tcp_output.c
+--- linux-3.12.38/net/ipv4/tcp_output.c	2015-07-07 22:02:58.497785981 -0400
++++ linux-3.12.38.modified/net/ipv4/tcp_output.c	2015-07-07 21:31:38.525703991 -0400
+@@ -186,6 +186,7 @@
+ 	inet_csk_clear_xmit_timer(sk, ICSK_TIME_DACK);
+ }
+ 
++static inline unsigned int tcp_cwnd_test(const struct tcp_sock *tp, const struct sk_buff *skb);
+ 
+ u32 tcp_default_init_rwnd(u32 mss)
+ {
+@@ -536,15 +537,12 @@
+ 	if (likely(sysctl_tcp_timestamps && *md5 == NULL)) {
+ 		opts->options |= OPTION_TS;
+ 		if (likely (tp->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE)) {
+-			struct timeval tv;
+-			u64 time_stamp64;
+-			do_gettimeofday(&tv);
+-			time_stamp64 = tv.tv_sec * 1000000 + tv.tv_usec;
+-			opts->tsval = (u32)(time_stamp64  & (u64)LONG_MASK) + tp->tsoffset;
++			opts->tsval = tcp_bw_get_stamp_us() + tp->tsoffset;
++			opts->tsecr = tp->rx_opt.ts_recent_us;
+ 		} else {
+ 			opts->tsval = TCP_SKB_CB(skb)->when + tp->tsoffset;
++			opts->tsecr = tp->rx_opt.ts_recent;
+ 		}
+-		opts->tsecr = tp->rx_opt.ts_recent;
+ 		remaining -= TCPOLEN_TSTAMP_ALIGNED;
+ 	}
+ 	if (likely(sysctl_tcp_window_scaling)) {
+@@ -612,16 +610,13 @@
+ 	if (likely(ireq->tstamp_ok)) {
+ 		opts->options |= OPTION_TS;
+ 		if (likely (tcp_sk(sk)->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE)) {
+-			struct timeval tv;
+-			u64 time_stamp64;
+-			do_gettimeofday(&tv);
+-			time_stamp64 = tv.tv_sec * 1000000 + tv.tv_usec;
+-			opts->tsval = (u32)(time_stamp64  & (u64)LONG_MASK);
++			opts->tsval = tcp_bw_get_stamp_us();
++			opts->tsecr = req->ts_recent_us;
+ 		} else {
+ 			opts->tsval = TCP_SKB_CB(skb)->when;
++			opts->tsecr = req->ts_recent;
+ 		}
+ 
+-		opts->tsecr = req->ts_recent;
+ 		remaining -= TCPOLEN_TSTAMP_ALIGNED;
+ 	}
+ 	if (likely(ireq->sack_ok)) {
+@@ -669,16 +664,12 @@
+ 	if (likely(tp->rx_opt.tstamp_ok)) {
+ 		opts->options |= OPTION_TS;
+ 		if (likely (tp->bw_est_stats.est_mode != TCP_BW_EST_TYPE_NO_ACTIVE)) {
+-			struct timeval tv;
+-			u64 time_stamp64;
+-			do_gettimeofday(&tv);
+-			time_stamp64 = tv.tv_sec * 1000000 + tv.tv_usec;
+-			opts->tsval = tcb ? (u32)(time_stamp64  & (u64)LONG_MASK) +
+-					tp->tsoffset : 0;
++			opts->tsval = tcb ? tcp_bw_get_stamp_us() + tp->tsoffset : 0;
++			opts->tsecr = tp->rx_opt.ts_recent_us;
+ 		} else {
+ 			opts->tsval = tcb ? tcb->when + tp->tsoffset : 0;
++			opts->tsecr = tp->rx_opt.ts_recent;
+ 		}
+-		opts->tsecr = tp->rx_opt.ts_recent;
+ 		size += TCPOLEN_TSTAMP_ALIGNED;
+ 	}
+ 
+@@ -2458,8 +2449,14 @@
+ 		tp->retrans_out += tcp_skb_pcount(skb);
+ 
+ 		/* Save stamp of the first retransmit. */
+-		if (!tp->retrans_stamp)
+-			tp->retrans_stamp = TCP_SKB_CB(skb)->when;
++		if (!tp->retrans_stamp) {
++		   u32 when;
++		   if (TCP_BW_IS_ACTIVE(tp)) {
++             when = tcp_bw_get_stamp_us();
++         } else
++             when = tcp_time_stamp;
++			tp->retrans_stamp = when;
++		}
+ 
+ 		/* snd_nxt is stored to detect loss of retransmitted segment,
+ 		 * see tcp_input.c tcp_sacktag_write_queue().
+diff --exclude CVS --exclude .git -uNr linux-3.12.38/net/ipv4/tcp_westwood.c linux-3.12.38.modified/net/ipv4/tcp_westwood.c
+--- linux-3.12.38/net/ipv4/tcp_westwood.c	2015-07-07 22:02:58.481785980 -0400
++++ linux-3.12.38.modified/net/ipv4/tcp_westwood.c	2015-07-07 21:24:41.213685791 -0400
+@@ -220,8 +220,7 @@
+ 	const struct tcp_sock *tp = tcp_sk(sk);
+ 	const struct westwood *w = inet_csk_ca(sk);
+ 
+-	if ((tp->bw_est_stats.est_mode !=
+-			tp->bw_est_stats.TCP_BW_EST_TYPE_NO_ACTIVE)) {
++	if (TCP_BW_IS_ACTIVE(tp)) {
+ 		return tp->bw_est_stats.bdpe_rx;
+ 	}
+ 
